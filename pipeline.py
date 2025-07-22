@@ -10,6 +10,7 @@ from sklearn.ensemble import RandomForestClassifier, AdaBoostClassifier, ExtraTr
 from sklearn.tree import DecisionTreeClassifier
 from sklearn.neural_network import MLPClassifier
 from sklearn.naive_bayes import GaussianNB
+from sklearn.linear_model import LogisticRegression
 from xgboost import XGBClassifier
 from lightgbm import LGBMClassifier
 from catboost import CatBoostClassifier
@@ -96,22 +97,89 @@ def get_model(model_name, trial):
         return DecisionTreeClassifier(**params)
 
     elif model_name == "MLP":
-        num_layers = trial.suggest_int("mlp_num_layers", 3, 12)  # Number of layers between 2 and 5
+        num_layers = trial.suggest_int("mlp_num_layers", 3, 8) 
         hidden_layer_sizes = tuple(
             trial.suggest_int(f"mlp_layer_{i}", 50, 200, step=25) for i in range(num_layers)  # Nodes as multiples of 25
         )
         params = {
             "hidden_layer_sizes": hidden_layer_sizes,  # Suggested hidden layer sizes
             "activation": trial.suggest_categorical("mlp_activation", ["relu", "tanh", "logistic"]),  # Activation function
-            "alpha": trial.suggest_float("mlp_alpha", 1e-4, 1e-2, log=True)  # Regularization term alpha
+            "alpha": trial.suggest_float("mlp_alpha", 1e-4, 1e-2, log=True),  # Regularization term alpha
+            "solver": trial.suggest_categorical("solver", ["adam", "sgd", "lbfgs"]),
+            "max_iter": trial.suggest_int("max_iter", 100, 500, step=50),
+            "learning_rate": trial.suggest_categorical("learning_rate", ["constant", "invscaling", "adaptive"]),
+            "learning_rate_init": trial.suggest_loguniform("learning_rate_init", 1e-4, 1e-1),
+            "early_stopping": True,
         }
         return MLPClassifier(**params)
 
     elif model_name == "NB":
         return GaussianNB()
-
+        
+    elif model_name == "Stacking":
+        models = []
+        for model_name in model_space:
+            if trial.suggest_categorical(f"use_{model_name}", [True, False]):   
+                model = get_model(model_name, trial)
+                models.append(model)
+                
+        if not models: # empty
+            model = get_model(model_name, trial) # get last model only
+            models.append(model)
+            
+        ensembler = LogisticRegression()
+        stacking_model = StackingMetaModelClassifier(models, ensembler)
+        return stacking_model
     else:
-        raise ValueError(f"Model {model_name} is not supported!")
+        raise ValueError(f"Unsupported model: {model_name}")
+
+class StackingMetaModelClassifier:
+    def __init__(self, models, ensembler):
+        """
+        Parameters
+        ----------
+        models : list
+            List of initialized ML models that serves as a base predictions.
+        ensembler : ML model
+            Meta-level model that combines base model predictions.
+        """
+        self.models = models
+        self.ensembler = ensembler
+        self.is_fitted = False
+
+    def _get_predictions(self, X, proba=True):
+        preds = []
+        for model in self.models:
+            if proba and hasattr(model, "predict_proba"):
+                preds.append(model.predict_proba(X))
+            else:
+                preds.append(model.predict(X).reshape(-1, 1))
+        return np.hstack(preds)
+
+    def fit(self, X_train, y_train):
+        for model in self.models:
+            model.fit(X_train, y_train)
+        X_meta = self._get_predictions(X_train)
+        self.ensembler.fit(X_meta, y_train)
+        self.is_fitted = True
+
+    def predict(self, X, return_meta=False):
+        if not self.is_fitted:
+            raise RuntimeError("Model must be fitted before predicting.")
+        X_meta = self._get_predictions(X)
+        y_pred = self.ensembler.predict(X_meta)
+        return (y_pred, X_meta) if return_meta else y_pred
+
+model_space = {
+    "NB": GaussianNB,
+    "DT": DecisionTreeClassifier,
+    "MLP": MLPClassifier,
+    "RF": RandomForestClassifier,
+    "ET": ExtraTreesClassifier,
+    "XGB": XGBClassifier,
+    "LGB": LGBMClassifier,
+    "CB": CatBoostClassifier,
+}
 
 # Hyperparameter optimization
 def objective(trial, model_name, X, y):
@@ -138,7 +206,7 @@ def objective(trial, model_name, X, y):
 def tune_model(model_name, X, y):
     """Run Optuna optimization for a given model."""
     study = optuna.create_study(direction="maximize", pruner=optuna.pruners.MedianPruner())  
-    study.optimize(lambda trial: objective(trial, model_name, X, y), n_trials=200, show_progress_bar=True)
+    study.optimize(lambda trial: objective(trial, model_name, X, y), n_trials=200, show_progress_bar=True, timeout=7200)
     return study.best_params
 
 def run_pipeline(model_name, folds, name_prefix, temp_save='temp_single_pipeline.pkl'):
@@ -211,6 +279,7 @@ def run_pipeline(model_name, folds, name_prefix, temp_save='temp_single_pipeline
     y_tests = np.concatenate(y_test_folds)
     
     out = extended_confusion_matrix(y_tests, y_preds, class_names=class_names, prefix=name_prefix)
+    _ = replot_extended_confusion_matrix(out, n_run=20, class_names=class_names, prefix=name_prefix+"_avg")
 
     # Convert list of tuples into a DataFrame
     df_results = pd.DataFrame(result_folds, columns=["Accuracy", "Precision", "Recall", "F1-Score"])

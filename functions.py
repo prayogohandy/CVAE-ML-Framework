@@ -9,7 +9,7 @@ import torch
 import random
 import os
 
-from sklearn.preprocessing import StandardScaler, MinMaxScaler, OneHotEncoder
+from sklearn.preprocessing import StandardScaler, MinMaxScaler, OneHotEncoder, OrdinalEncoder
 import pickle
 
 # Save results to a pickle file
@@ -73,46 +73,37 @@ def print_ranges(df):
     print(ranges)
 
 
-def process_dataframe(df, label=None, scaler='standard', existing_info=None):
+def process_dataframe(df, label=None, scaler='standard', categorical_encoder='onehot', existing_info=None):
     """
-    Process a dataframe for ML models with optional reuse of previously fitted scalers/encoders.
-
+    Process a dataframe for ML models with numerical scaler and categorical encoder.
+    
     Parameters
     ----------
     df : pd.DataFrame
-        Input feature dataframe.
-    label : pd.DataFrame, pd.Series, or None
-        Label to be one-hot encoded.
+        Input features.
+    label : pd.Series or pd.DataFrame, optional
+        Target labels.
     scaler : str
         One of ['none', 'standard', 'minmax'].
-    existing_info : dict or None
-        Contains the pre-fitted scaler, OHE encoders, and label encoder.
+    categorical_encoder : str
+        One of ['onehot', 'ordinal'].
+    existing_info : dict, optional
+        Previously fitted scalers and encoders.
 
-    Returns
-    -------
-    torch.Tensor : feature tensor
-    torch.Tensor or None : label tensor
-    int : number of numerical columns
-    list : list of one-hot encoded dimensions for categorical columns
-    dict : processing info (scalers, encoders, column names)
     """
     fit = existing_info is None
     numerical_cols = df.select_dtypes(include=['number']).columns.tolist()
-    categorical_cols = df.select_dtypes(include=['object']).columns.tolist()
+    categorical_cols = df.select_dtypes(include=['object', 'category']).columns.tolist()
 
-    # Handle scaler
+    # --- Scale numerical ---
     scaler_dict = {
         'standard': StandardScaler(),
         'minmax': MinMaxScaler(),
         'none': None
     }
     if scaler not in scaler_dict:
-        raise ValueError(f"Scaler '{scaler}' not recognized.")
-
-    if fit:
-        selected_scaler = scaler_dict[scaler]
-    else:
-        selected_scaler = existing_info['selected_scaler']
+        raise ValueError(f"Unknown scaler: {scaler}")
+    selected_scaler = scaler_dict[scaler] if fit else existing_info['selected_scaler']
 
     df_numerical = df[numerical_cols].copy()
     if selected_scaler is not None:
@@ -127,30 +118,52 @@ def process_dataframe(df, label=None, scaler='standard', existing_info=None):
                 columns=numerical_cols, index=df.index
             )
 
-    # Categorical encoding
-    ohe_dfs = []
-    ohe_scalers = [] if fit else existing_info['ohe_scalers']
+    # --- Encode categorical ---
+    if categorical_encoder not in ['onehot', 'ordinal']:
+        raise ValueError("categorical_encoder must be 'onehot' or 'ordinal'.")
+
+    encoded_df = None
+    encoders = [] if fit else existing_info['encoders']
     len_ohes = []
 
-    for i, col in enumerate(categorical_cols):
-        if fit:
-            ohe = OneHotEncoder(sparse_output=False, handle_unknown='ignore')
-            ohe_transformed = ohe.fit_transform(df[[col]])
-            ohe_scalers.append(ohe)
-        else:
-            ohe = ohe_scalers[i]
-            ohe_transformed = ohe.transform(df[[col]])
+    if categorical_cols:
+        if categorical_encoder == 'onehot':
+            ohe_dfs = []
+            for i, col in enumerate(categorical_cols):
+                if fit:
+                    enc = OneHotEncoder(sparse_output=False, handle_unknown='ignore')
+                    encoded = enc.fit_transform(df[[col]])
+                    encoders.append(enc)
+                else:
+                    enc = encoders[i]
+                    encoded = enc.transform(df[[col]])
 
-        ohe_columns = ohe.get_feature_names_out([col])
-        ohe_df = pd.DataFrame(ohe_transformed, columns=ohe_columns, index=df.index)
+                ohe_cols = enc.get_feature_names_out([col])
+                ohe_df = pd.DataFrame(encoded, columns=ohe_cols, index=df.index)
+                ohe_dfs.append(ohe_df)
+                len_ohes.append(ohe_df.shape[1])
 
-        ohe_dfs.append(ohe_df)
-        len_ohes.append(ohe_df.shape[1])
+            encoded_df = pd.concat(ohe_dfs, axis=1)
 
-    final_df = pd.concat([df_numerical] + ohe_dfs, axis=1) if ohe_dfs else df_numerical
+        elif categorical_encoder == 'ordinal':
+            if fit:
+                enc = OrdinalEncoder()
+                encoded = enc.fit_transform(df[categorical_cols])
+                encoders = enc
+            else:
+                enc = encoders
+                encoded = enc.transform(df[categorical_cols])
 
-    # Label processing
-    label_ohe_df = None
+            encoded_df = pd.DataFrame(encoded, columns=categorical_cols, index=df.index)
+
+    # --- Combine numerical and categorical ---
+    if encoded_df is not None:
+        final_df = pd.concat([df_numerical, encoded_df], axis=1)
+    else:
+        final_df = df_numerical
+
+    # --- Label processing ---
+    label_array = None
     label_scaler = None if fit else existing_info.get('label_scaler')
     if label is not None:
         if isinstance(label, pd.Series):
@@ -165,85 +178,83 @@ def process_dataframe(df, label=None, scaler='standard', existing_info=None):
         else:
             label_ohe = label_scaler.transform(label)
 
-        label_columns = label_scaler.get_feature_names_out(label.columns)
-        label_ohe_df = pd.DataFrame(label_ohe, columns=label_columns, index=label.index)
+        label_array = label_ohe.astype(np.float32)
 
-    # Convert to tensors
-    feature_tensor = torch.tensor(final_df.to_numpy(dtype=np.float32), dtype=torch.float32)
-    label_tensor = (
-        torch.tensor(label_ohe_df.to_numpy(dtype=np.float32), dtype=torch.float32)
-        if label_ohe_df is not None else None
-    )
+    # --- Final output ---
+    feature_array = final_df.to_numpy(dtype=np.float32)
 
     additional_info = {
         'numerical_cols': numerical_cols,
         'categorical_cols': categorical_cols,
         'selected_scaler': selected_scaler,
-        'ohe_scalers': ohe_scalers,
+        'encoders': encoders,
+        'encoder_type': categorical_encoder,
         'label_scaler': label_scaler,
-        'label_dim': label_ohe_df.shape[1] if label_ohe_df is not None else 0
+        'label_dim': label_array.shape[1] if label_array is not None else 0,
+        'len_numerical': len(numerical_cols),
+        'len_ohes': len_ohes if categorical_encoder == 'onehot' else None
     }
 
-    return feature_tensor, label_tensor, len(numerical_cols), len_ohes, additional_info
+    return feature_array, label_array, additional_info
 
-
-def reverse_process_dataframe(processed_data, len_numerical, len_ohes, additional_info):
+def reverse_process_dataframe(processed_data, additional_info):
     """
-    Reverse the processed dataframe or tensor array to its original form by reversing scaling on numerical columns
-    and converting one-hot encoded columns back to categorical values using the fitted OHE scalers.
+    Reverse processed dataframe or tensor array to its original form.
 
     Parameters:
     -----------
-    processed_data : pd.DataFrame or torch.Tensor
-        The processed data with scaled numerical columns and one-hot encoded categorical columns.
-    len_numerical : int
-        The number of numerical columns in the original dataframe.
-    len_ohes : list
-        List containing the number of one-hot encoded columns for each categorical feature.
+    processed_data : pd.DataFrame, np.ndarray, or torch.Tensor
+        Processed data (numerical + encoded categorical).
     additional_info : dict
-        A dictionary containing column names, the scaler that was used during processing, 
-        and the list of fitted OneHotEncoder objects.
+        Info dict containing scalers and encoders used.
 
     Returns:
     --------
     pd.DataFrame
-        The reversed dataframe with original numerical and categorical columns.
+        Reconstructed dataframe with original numerical and categorical columns.
     """
-
     scaler = additional_info['selected_scaler']
-    ohe_scalers = additional_info['ohe_scalers']
+    encoders = additional_info['encoders']
+    encoder_type = additional_info['encoder_type']
     numerical_cols = additional_info['numerical_cols']
     categorical_cols = additional_info['categorical_cols']
+    len_numerical = additional_info['len_numerical']
+    len_ohes = additional_info.get('len_ohes')
 
-    # Convert to NumPy array if processed_data is a PyTorch tensor
+    # Convert tensor to numpy if needed
     if isinstance(processed_data, torch.Tensor):
         processed_data = processed_data.detach().cpu().numpy()
 
     # Step 1: Reverse scaling for numerical columns
+    numerical_array = processed_data[:, :len_numerical]
     if scaler is not None:
-        numerical_data = scaler.inverse_transform(processed_data[:, :len_numerical])
-    else:
-        numerical_data = processed_data[:, :len_numerical]
+        numerical_array = scaler.inverse_transform(numerical_array)
 
-    # Step 2: Reverse one-hot encoding for categorical columns
-    start_idx = len_numerical
-    categorical_data = {}
+    reversed_df = pd.DataFrame(numerical_array, columns=numerical_cols)
 
-    for i, (ohe_len, ohe_scaler, cat_col) in enumerate(zip(len_ohes, ohe_scalers, categorical_cols)):
-        # Extract the one-hot encoded columns for this categorical feature
-        ohe_columns = processed_data[:, start_idx:start_idx + ohe_len]
+    # Step 2: Reverse categorical encoding
+    if encoder_type == 'onehot':
+        start_idx = len_numerical
+        for i, (cat_col, ohe_len, ohe_encoder) in enumerate(zip(categorical_cols, len_ohes, encoders)):
+            ohe_data = processed_data[:, start_idx:start_idx + ohe_len]
 
-        # Reverse the one-hot encoding using the fitted OHE scaler
-        categorical_data[cat_col] = ohe_scaler.inverse_transform(ohe_columns)
+            # Enforce proper one-hot (argmax-based)
+            argmax_indices = np.argmax(ohe_data, axis=1)
+            one_hot_clean = np.zeros_like(ohe_data)
+            one_hot_clean[np.arange(ohe_data.shape[0]), argmax_indices] = 1
 
-        # Move to the next set of OHE columns
-        start_idx += ohe_len
+            # Decode to category labels
+            cat_values = ohe_encoder.inverse_transform(one_hot_clean)
+            reversed_df[cat_col] = cat_values.flatten()
 
-    # Step 3: Combine numerical and categorical columns
-    reversed_df = pd.DataFrame(numerical_data, columns=numerical_cols)
+            start_idx += ohe_len
 
-    for cat_col, cat_data in categorical_data.items():
-        reversed_df[cat_col] = cat_data.flatten()  # Flatten to get rid of extra dimension
+    elif encoder_type == 'ordinal':
+        ordinal_data = processed_data[:, len_numerical:]
+        ordinal_data_rounded = np.rint(ordinal_data).astype(int)
+        cat_values = encoders.inverse_transform(ordinal_data_rounded)
+        for i, col in enumerate(categorical_cols):
+            reversed_df[col] = cat_values[:, i]
 
     return reversed_df
 
