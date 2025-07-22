@@ -8,18 +8,14 @@ from collections import Counter
 from matplotlib.colors import ListedColormap
 from sklearn.metrics import confusion_matrix, precision_score, recall_score, accuracy_score, f1_score, classification_report
 
-FONT_ANNOT = 12
+FONT_ANNOT = 18
 FONT_TITLE = 16
 FONT_AXIS = 14
-FONT_TICKS = 12
+FONT_TICKS = 14
+
+plt.rcParams["font.family"] = 'Times New Roman'
 
 def extended_confusion_matrix(y_true, y_pred, y_mask=None, plot=True, class_names=None, prefix=None):
-    # Constants for font sizes
-    FONT_ANNOT = 14
-    FONT_TITLE = 16
-    FONT_AXIS = 14
-    FONT_TICKS = 14
-
     if class_names is None:
         unique_classes = np.unique(y_true)
         class_names = [f'{i}' for i in unique_classes]
@@ -87,12 +83,6 @@ def extended_confusion_matrix(y_true, y_pred, y_mask=None, plot=True, class_name
 
 
 def replot_extended_confusion_matrix(output, n_run=20, class_names=None, prefix=None):
-    # Constants for font sizes
-    FONT_ANNOT = 14
-    FONT_TITLE = 16
-    FONT_AXIS = 14
-    FONT_TICKS = 14
-
     cm, recall, precision, accuracy = output
 
     if class_names is None:
@@ -146,7 +136,7 @@ def classification_result(y_true, y_pred):
     f1 = f1_score(y_true, y_pred, average="macro")
     return accuracy, precision, recall, f1
 
-def get_unique_filename(save_dir="plots", base_name="boxplot", extension="png"):
+def get_unique_filename(save_dir="plots", base_name="boxplot", extension="tiff"):
     """
     Generate a unique filename by appending an incrementing counter to the base name.
     
@@ -177,7 +167,7 @@ def get_unique_filename(save_dir="plots", base_name="boxplot", extension="png"):
     
     return os.path.join(save_dir, filename)
 
-def plot_metric_boxplot(results_dict, models, folds, metric="Accuracy", alt_names=None):
+def plot_metric_boxplot(results_dict, models, folds, metric="Accuracy", alt_names=None, filename=None):
     """
     Plot a boxplot for a specific metric across different methods and fold types.
     
@@ -237,12 +227,13 @@ def plot_metric_boxplot(results_dict, models, folds, metric="Accuracy", alt_name
     plt.figure(figsize=(10, 6))
     sns.boxplot(x="Model", y="Metric", hue="Fold", data=df_plot)
     plt.ylabel(metric)  # Rename the y-axis label
-    plt.title(f"Boxplot of {metric} Across Models and Folds")
+    # plt.title(f"Boxplot of {metric} Across Models and Folds")
 
     plt.xticks(rotation=90)
     
     # Generate unique filename with timestamp
-    filename = get_unique_filename()
+    if filename is None:
+        filename = get_unique_filename()
 
     plt.savefig(filename, bbox_inches="tight", dpi=600)
     plt.show()
