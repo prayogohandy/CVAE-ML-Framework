@@ -49,7 +49,7 @@ def remove_method_from_result(key, save_path="temp_multi_pipeline.pkl"):
     # Remove all keys that start with key
     results_dict = {
         k: v for k, v in results_dict.items()
-        if not (k.startswith(key) )
+        if key not in k
     }
 
     # Save the updated results back to the file
@@ -73,27 +73,58 @@ def print_ranges(df):
     print(ranges)
 
 
-def process_dataframe(df, label=None, scaler='standard', categorical_encoder='onehot', existing_info=None):
+def process_dataframe(
+    df, 
+    label=None, 
+    scaler='standard', 
+    categorical_encoder='onehot', 
+    existing_info=None
+):
     """
-    Process a dataframe for ML models with numerical scaler and categorical encoder.
-    
+    Process a dataframe for ML models: scales numerical features and encodes categorical features.
+
     Parameters
     ----------
     df : pd.DataFrame
         Input features.
     label : pd.Series or pd.DataFrame, optional
         Target labels.
-    scaler : str
+    scaler : str, default 'standard'
         One of ['none', 'standard', 'minmax'].
-    categorical_encoder : str
+    categorical_encoder : str, default 'onehot'
         One of ['onehot', 'ordinal'].
     existing_info : dict, optional
-        Previously fitted scalers and encoders.
+        Previously fitted scalers and encoders for transform-only mode.
 
+    Returns
+    -------
+    feature_array : np.ndarray
+        Processed feature array.
+    label_array : np.ndarray or None
+        Processed label array (if label is provided).
+    additional_info : dict
+        Dict with fitted scalers/encoders and metadata for inverse transform.
     """
     fit = existing_info is None
-    numerical_cols = df.select_dtypes(include=['number']).columns.tolist()
+    numerical_cols = df.select_dtypes(include=[np.number]).columns.tolist()
     categorical_cols = df.select_dtypes(include=['object', 'category']).columns.tolist()
+
+    # Detect feature constraints and store indexes
+    feature_layer = {
+        'softplus': [],
+        'relu': [],
+        'unconstrained': []
+    }
+
+    df_numerical = df[numerical_cols].copy()
+    for idx, col in enumerate(df_numerical.columns):
+        min_val = df_numerical[col].min()
+        if min_val > 0:
+            feature_layer['softplus'].append(idx)
+        elif min_val >= 0:
+            feature_layer['relu'].append(idx)
+        else:
+            feature_layer['unconstrained'].append(idx)
 
     # --- Scale numerical ---
     scaler_dict = {
@@ -105,18 +136,11 @@ def process_dataframe(df, label=None, scaler='standard', categorical_encoder='on
         raise ValueError(f"Unknown scaler: {scaler}")
     selected_scaler = scaler_dict[scaler] if fit else existing_info['selected_scaler']
 
-    df_numerical = df[numerical_cols].copy()
     if selected_scaler is not None:
         if fit:
-            df_numerical = pd.DataFrame(
-                selected_scaler.fit_transform(df_numerical),
-                columns=numerical_cols, index=df.index
-            )
+            df_numerical.loc[:, :] = selected_scaler.fit_transform(df_numerical)
         else:
-            df_numerical = pd.DataFrame(
-                selected_scaler.transform(df_numerical),
-                columns=numerical_cols, index=df.index
-            )
+            df_numerical.loc[:, :] = selected_scaler.transform(df_numerical)
 
     # --- Encode categorical ---
     if categorical_encoder not in ['onehot', 'ordinal']:
@@ -137,14 +161,11 @@ def process_dataframe(df, label=None, scaler='standard', categorical_encoder='on
                 else:
                     enc = encoders[i]
                     encoded = enc.transform(df[[col]])
-
                 ohe_cols = enc.get_feature_names_out([col])
                 ohe_df = pd.DataFrame(encoded, columns=ohe_cols, index=df.index)
                 ohe_dfs.append(ohe_df)
                 len_ohes.append(ohe_df.shape[1])
-
             encoded_df = pd.concat(ohe_dfs, axis=1)
-
         elif categorical_encoder == 'ordinal':
             if fit:
                 enc = OrdinalEncoder()
@@ -153,7 +174,6 @@ def process_dataframe(df, label=None, scaler='standard', categorical_encoder='on
             else:
                 enc = encoders
                 encoded = enc.transform(df[categorical_cols])
-
             encoded_df = pd.DataFrame(encoded, columns=categorical_cols, index=df.index)
 
     # --- Combine numerical and categorical ---
@@ -166,18 +186,14 @@ def process_dataframe(df, label=None, scaler='standard', categorical_encoder='on
     label_array = None
     label_scaler = None if fit else existing_info.get('label_scaler')
     if label is not None:
-        if isinstance(label, pd.Series):
-            label = label.to_frame()
-
+        label = label.to_frame() if isinstance(label, pd.Series) else label
         if label.shape[1] != 1:
             raise ValueError("label must have exactly one column.")
-
         if fit:
             label_scaler = OneHotEncoder(sparse_output=False, handle_unknown='ignore')
             label_ohe = label_scaler.fit_transform(label)
         else:
             label_ohe = label_scaler.transform(label)
-
         label_array = label_ohe.astype(np.float32)
 
     # --- Final output ---
@@ -192,7 +208,8 @@ def process_dataframe(df, label=None, scaler='standard', categorical_encoder='on
         'label_scaler': label_scaler,
         'label_dim': label_array.shape[1] if label_array is not None else 0,
         'len_numerical': len(numerical_cols),
-        'len_ohes': len_ohes if categorical_encoder == 'onehot' else None
+        'len_ohes': len_ohes if categorical_encoder == 'onehot' else None,
+        'feature_layer': feature_layer
     }
 
     return feature_array, label_array, additional_info
